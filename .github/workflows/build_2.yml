@@ -1,0 +1,109 @@
+name: Build OPlus LXC Kernel (OnePlus 13 SM8750)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout 本仓库（LXC patches 等）
+        uses: actions/checkout@v4
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            repo git python3 python-is-python3 bc bison flex \
+            libssl-dev libelf-dev device-tree-compiler ccache \
+            libncurses5-dev libtinfo5 build-essential \
+            android-sdk-platform-tools-common
+
+      - name: 配置 repo 工具
+        run: |
+          mkdir -p ~/bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo 'export PATH=~/bin:$PATH' >> $GITHUB_ENV
+
+      - name: Git 配置
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: 创建 workspace 并同步官方内核源码
+        run: |
+          mkdir -p workspace/kernel_workspace
+          cd workspace/kernel_workspace
+          
+          echo "正在 repo init OnePlus 13 kernel manifest..."
+          repo init --depth=1 -u https://github.com/OnePlusOSS/kernel_manifest.git \
+            -b oneplus/sm8750 -m oneplus_13.xml --no-repo-verify
+          
+          echo "正在 repo sync..."
+          repo sync -c --no-tags --no-clone-bundle --optimized-fetch --force-sync -j$(nproc --all)
+
+      - name: 应用 LXC patches
+        run: |
+          if [ -d "patches" ]; then
+            echo "发现 LXC patches，正在应用..."
+            cd workspace/kernel_workspace/kernel_platform
+            for patch in ${{ github.workspace }}/patches/*.patch; do
+              if [ -f "$patch" ]; then
+                echo "Applying $(basename $patch)"
+                git apply --ignore-whitespace "$patch" || echo "Warning: patch failed, continuing..."
+              fi
+            done
+          else
+            echo "未发现 patches 目录，跳过"
+          fi
+
+      - name: 编译内核
+        run: |
+          cd workspace/kernel_workspace/kernel_platform
+          echo "开始编译 OnePlus 13 (sun) 内核，LTO=thin + REPACK_IMG"
+          LTO=thin REPACK_IMG=true ./build/kernel/build.sh -c sun
+
+      # ==================== 新增：打包 AnyKernel3 ====================
+      - name: 克隆 AnyKernel3 并复制内核文件
+        run: |
+          cd ${{ github.workspace }}
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          
+          echo "正在复制内核输出文件（Image / dtb / dtbo / boot.img）..."
+          cd workspace/kernel_workspace/kernel_platform
+          find out -type f \( -name "Image*" -o -name "*.dtb*" -o -name "dtbo.img" -o -name "boot.img" \) -exec cp {} ${{ github.workspace }}/AnyKernel3/ \; 2>/dev/null || true
+          
+          echo "复制完成的文件列表："
+          ls -lh ${{ github.workspace }}/AnyKernel3/
+
+      - name: 配置 AnyKernel3（设备名、内核名称）
+        run: |
+          cd AnyKernel3
+          sed -i 's/device.name1=.*/device.name1=sun/' anykernel.sh
+          sed -i 's/device.name2=.*/device.name2=OnePlus13/' anykernel.sh
+          sed -i 's/kernel.string=.*/kernel.string=OPlus LXC Kernel (ret9rn)/' anykernel.sh
+          echo "anykernel.sh 配置完成："
+          grep -E 'device.name|kernel.string' anykernel.sh
+
+      - name: 打包 AnyKernel3 ZIP
+        run: |
+          cd AnyKernel3
+          zip -r9 ${{ github.workspace }}/OPlus_LXC_Kernel-AnyKernel3.zip * -x .git* README.md
+          echo "打包完成："
+          ls -lh ${{ github.workspace }}/*.zip
+
+      # ==================== 上传产物 ====================
+      - name: 上传 AnyKernel3 ZIP（推荐刷 recovery）
+        uses: actions/upload-artifact@v4
+        with:
+          name: OPlus-LXC-Kernel-OnePlus13-AnyKernel3
+          path: OPlus_LXC_Kernel-AnyKernel3.zip
+          if-no-files-found: warn
+          retention-days: 30
