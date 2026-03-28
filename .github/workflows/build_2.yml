@@ -16,14 +16,18 @@ jobs:
       - name: Checkout 本仓库（LXC patches 等）
         uses: actions/checkout@v4
 
-      - name: 安装构建依赖
+      - name: 安装构建依赖（已修复 libtinfo5 问题）
         run: |
           sudo apt-get update -y
           sudo apt-get install -y \
             repo git python3 python-is-python3 bc bison flex \
             libssl-dev libelf-dev device-tree-compiler ccache \
-            libncurses5-dev libtinfo5 build-essential \
-            android-sdk-platform-tools-common
+            libncurses6 libncurses-dev libtinfo6 \
+            build-essential android-sdk-platform-tools-common
+
+          # 创建 libtinfo.so.5 兼容链接（解决旧工具依赖问题）
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.5
+          echo "已创建 libtinfo.so.5 兼容链接"
 
       - name: 配置 repo 工具
         run: |
@@ -70,13 +74,12 @@ jobs:
           echo "开始编译 OnePlus 13 (sun) 内核，LTO=thin + REPACK_IMG"
           LTO=thin REPACK_IMG=true ./build/kernel/build.sh -c sun
 
-      # ==================== 新增：打包 AnyKernel3 ====================
       - name: 克隆 AnyKernel3 并复制内核文件
         run: |
           cd ${{ github.workspace }}
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
           
-          echo "正在复制内核输出文件（Image / dtb / dtbo / boot.img）..."
+          echo "正在复制内核输出文件..."
           cd workspace/kernel_workspace/kernel_platform
           find out -type f \( -name "Image*" -o -name "*.dtb*" -o -name "dtbo.img" -o -name "boot.img" \) -exec cp {} ${{ github.workspace }}/AnyKernel3/ \; 2>/dev/null || true
           
@@ -99,7 +102,6 @@ jobs:
           echo "打包完成："
           ls -lh ${{ github.workspace }}/*.zip
 
-      # ==================== 上传产物 ====================
       - name: 上传 AnyKernel3 ZIP（推荐刷 recovery）
         uses: actions/upload-artifact@v4
         with:
