@@ -35,19 +35,36 @@ jobs:
           mkdir workspace && cd workspace
           git config --global user.name "Bot"
           git config --global user.email "bot@example.com"
-          # 注意：这里的 manifest 链接请确保指向 Android 16 对应的分支
+          # 使用你提供的准确分支和清单文件
           repo init -u https://github.com/OnePlusOSS/kernel_manifest.git -b oneplus/sm8750 -m oneplus_13_b.xml --depth=1
           repo sync -c -j$(nproc) --no-clone-bundle --no-tags
 
       - name: Enable LXC Configs
         run: |
-          cd workspace/kernel_platform/msm-kernel
-          # 针对 Android 16 的 GKI 基础配置注入
-          # 优先尝试在 vendor 的 sun_v_gki_defconfig 中修改
-          CONF="arch/arm64/configs/vendor/sun_v_gki_defconfig"
-          [ ! -f "$CONF" ] && CONF=$(find arch/arm64/configs/vendor/ -name "*gki_defconfig" | head -n 1)
+          # 核心修正：从工作区根目录开始搜索，排除编译过程生成的干扰文件
+          cd workspace/kernel_platform
           
-          echo "Injecting LXC configs into $CONF"
+          echo "Searching for defconfig files in kernel_platform..."
+          # 这里的搜索路径针对 SM8750 进行了优化
+          # 它会寻找 vendor 下的 sun 平台相关配置，通常是 sun_gki_defconfig 或 oplus_sun_gki_defconfig
+          CONF=$(find msm-kernel/arch/arm64/configs -name "*sun*_defconfig" | grep "gki" | head -n 1)
+          
+          if [ -z "$CONF" ]; then
+            echo "Failed to find sun-specific gki_defconfig, trying generic GKI..."
+            CONF=$(find msm-kernel/arch/arm64/configs -name "gki_defconfig" | head -n 1)
+          fi
+
+          if [ -z "$CONF" ]; then
+            echo "ERROR: Could not find any suitable defconfig!"
+            # 这里的调试信息能帮你看到真实的路径
+            find msm-kernel/arch/arm64/configs -maxdepth 3
+            exit 1
+          fi
+
+          echo "Found defconfig at: $CONF"
+          echo "Injecting LXC configs..."
+          
+          # 追加 LXC 必要的内核开关
           cat <<EOF >> "$CONF"
           CONFIG_NAMESPACES=y
           CONFIG_USER_NS=y
@@ -62,19 +79,24 @@ jobs:
           CONFIG_VETH=y
           CONFIG_BRIDGE=y
           CONFIG_NETFILTER_XT_MATCH_COMMENT=y
+          CONFIG_POSIX_MQUEUE=y
+          CONFIG_IKCONFIG=y
+          CONFIG_IKCONFIG_PROC=y
           EOF
 
       - name: Build Kernel (Kleaf)
         run: |
           cd workspace/kernel_platform
-          # Android 16 强制开启 ABI 检查，自定义内核必须通过环境变量跳过
-          # --config=fast 禁用不必要的 DWARF 调试信息生成，节省磁盘和时间
+          
+          # 针对 Android 16 的 Bazel 环境配置
+          chmod +x tools/bazel
           export SKIP_ABI_WHITELIST=1
           export KLEAF_BYPASS_ABI_CHECK=1
           
-          # 执行构建：针对 sun 平台的 GKI 分发目标
-          ./tools/bazel run //msm-kernel:sun_v_gki_dist -- --dist_dir=../out --config=fast
-
+          # SM8750 的构建目标通常是 sun_gki 
+          # 使用 oneplus_13_b 对应的 dist 目标，如果报错，请尝试 //msm-kernel:sun_dist
+          ./tools/bazel run //msm-kernel:sun_gki_dist -- --dist_dir=../out --config=fast
+          
       - name: Package AnyKernel3
         run: |
           cd workspace
