@@ -32,39 +32,43 @@ jobs:
 
       - name: Sync Source
         run: |
-          mkdir workspace && cd workspace
+          mkdir -p workspace && cd workspace
           git config --global user.name "Bot"
           git config --global user.email "bot@example.com"
-          # 使用你提供的准确分支和清单文件
+          
+          # 1. 初始化并同步 (加上 --no-tags 和 --no-clone-bundle 提速)
           repo init -u https://github.com/OnePlusOSS/kernel_manifest.git -b oneplus/sm8750 -m oneplus_13_b.xml --depth=1
           repo sync -c -j$(nproc) --no-clone-bundle --no-tags
+          
+          # 2. 【核心修复】修正 Bazel 预期的构建路径
+          cd kernel_platform
+          
+          # 检查 build 目录是否存在，如果不存在则查找并建立软链接
+          if [ ! -d "build" ]; then
+            echo "Build directory not found at root, searching for oplus/build..."
+            if [ -d "oplus/build" ]; then
+              ln -s oplus/build build
+              echo "Linked oplus/build to build"
+            elif [ -d "common/build" ]; then
+              ln -s common/build build
+              echo "Linked common/build to build"
+            fi
+          fi
+
+          # 3. 【节省空间】源码同步完后立即删除巨大的 .repo 目录 (节省约 20-30GB)
+          cd ..
+          rm -rf .repo
+          echo "Deleted .repo to save space"
 
       - name: Enable LXC Configs
         run: |
-          # 核心修正：从工作区根目录开始搜索，排除编译过程生成的干扰文件
           cd workspace/kernel_platform
+          # 针对 SM8750 重新定位正确的 defconfig
+          # 通常路径为：msm-kernel/arch/arm64/configs/vendor/sun_gki_defconfig
+          CONF=$(find msm-kernel/arch/arm64/configs -name "sun_gki_defconfig" | head -n 1)
+          [ -z "$CONF" ] && CONF=$(find msm-kernel/arch/arm64/configs -name "*gki_defconfig" | head -n 1)
           
-          echo "Searching for defconfig files in kernel_platform..."
-          # 这里的搜索路径针对 SM8750 进行了优化
-          # 它会寻找 vendor 下的 sun 平台相关配置，通常是 sun_gki_defconfig 或 oplus_sun_gki_defconfig
-          CONF=$(find msm-kernel/arch/arm64/configs -name "*sun*_defconfig" | grep "gki" | head -n 1)
-          
-          if [ -z "$CONF" ]; then
-            echo "Failed to find sun-specific gki_defconfig, trying generic GKI..."
-            CONF=$(find msm-kernel/arch/arm64/configs -name "gki_defconfig" | head -n 1)
-          fi
-
-          if [ -z "$CONF" ]; then
-            echo "ERROR: Could not find any suitable defconfig!"
-            # 这里的调试信息能帮你看到真实的路径
-            find msm-kernel/arch/arm64/configs -maxdepth 3
-            exit 1
-          fi
-
-          echo "Found defconfig at: $CONF"
-          echo "Injecting LXC configs..."
-          
-          # 追加 LXC 必要的内核开关
+          echo "Injecting to $CONF"
           cat <<EOF >> "$CONF"
           CONFIG_NAMESPACES=y
           CONFIG_USER_NS=y
@@ -87,15 +91,14 @@ jobs:
       - name: Build Kernel (Kleaf)
         run: |
           cd workspace/kernel_platform
-          
-          # 针对 Android 16 的 Bazel 环境配置
           chmod +x tools/bazel
+          
           export SKIP_ABI_WHITELIST=1
           export KLEAF_BYPASS_ABI_CHECK=1
           
-          # SM8750 的构建目标通常是 sun_gki 
-          # 使用 oneplus_13_b 对应的 dist 目标，如果报错，请尝试 //msm-kernel:sun_dist
-          ./tools/bazel run //msm-kernel:sun_gki_dist -- --dist_dir=../out --config=fast
+          # 对于 oneplus_13_b，目标名可能是 //msm-kernel:sun_gki 或 //msm-kernel:sun_dist
+          # 如果不确定，可以先用 query 查一下。这里尝试最通用的 sun_dist
+          ./tools/bazel run //msm-kernel:sun_dist -- --dist_dir=../out --config=fast
           
       - name: Package AnyKernel3
         run: |
