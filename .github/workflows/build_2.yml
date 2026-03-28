@@ -10,24 +10,24 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
-      - name: Checkout 本仓库（LXC patches 等）
+      - name: Checkout 本仓库（存放你的其他 patches）
         uses: actions/checkout@v4
 
-      - name: 安装构建依赖（已修复 libtinfo5 问题）
+      - name: 安装构建依赖（已修复 libtinfo5）
         run: |
           sudo apt-get update -y
           sudo apt-get install -y \
             repo git python3 python-is-python3 bc bison flex \
             libssl-dev libelf-dev device-tree-compiler ccache \
             libncurses6 libncurses-dev libtinfo6 \
-            build-essential android-sdk-platform-tools-common
+            build-essential android-sdk-platform-tools-common zip
 
-          # 创建 libtinfo.so.5 兼容链接（解决旧工具依赖问题）
+          # 创建 libtinfo.so.5 兼容链接
           sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.5
-          echo "已创建 libtinfo.so.5 兼容链接"
+          echo "libtinfo.so.5 兼容链接已创建"
 
       - name: 配置 repo 工具
         run: |
@@ -41,7 +41,7 @@ jobs:
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
 
-      - name: 创建 workspace 并同步官方内核源码
+      - name: 同步官方内核源码
         run: |
           mkdir -p workspace/kernel_workspace
           cd workspace/kernel_workspace
@@ -50,29 +50,87 @@ jobs:
           repo init --depth=1 -u https://github.com/OnePlusOSS/kernel_manifest.git \
             -b oneplus/sm8750 -m oneplus_13.xml --no-repo-verify
           
-          echo "正在 repo sync..."
+          echo "正在 repo sync（耗时较长）..."
           repo sync -c --no-tags --no-clone-bundle --optimized-fetch --force-sync -j$(nproc --all)
 
-      - name: 应用 LXC patches
+      - name: 应用 LXC patches（如果有）和 LXC config
         run: |
-          if [ -d "patches" ]; then
-            echo "发现 LXC patches，正在应用..."
-            cd workspace/kernel_workspace/kernel_platform
+          cd workspace/kernel_workspace/kernel_platform
+          
+          # 应用你仓库里 patches/ 目录下的 .patch 文件（可选）
+          if [ -d "${{ github.workspace }}/patches" ]; then
+            echo "发现 patches 目录，正在应用..."
             for patch in ${{ github.workspace }}/patches/*.patch; do
               if [ -f "$patch" ]; then
                 echo "Applying $(basename $patch)"
-                git apply --ignore-whitespace "$patch" || echo "Warning: patch failed, continuing..."
+                git apply --ignore-whitespace "$patch" || echo "Warning: $(basename $patch) 应用失败，继续..."
               fi
             done
-          else
-            echo "未发现 patches 目录，跳过"
           fi
 
-      - name: 编译内核
+          # ==================== 直接嵌入 LXC config ====================
+          echo "正在追加 LXC 必要配置到 defconfig..."
+          cat >> arch/arm64/configs/sun_defconfig << 'EOF'
+
+# ====================== LXC 核心配置（直接嵌入） ======================
+CONFIG_NAMESPACES=y
+CONFIG_UTS_NS=y
+CONFIG_IPC_NS=y
+CONFIG_PID_NS=y
+CONFIG_NET_NS=y
+CONFIG_USER_NS=y
+CONFIG_CGROUP_NS=y
+CONFIG_MOUNT_NS=y
+
+# Control Groups (cgroups) - 必须
+CONFIG_CGROUPS=y
+CONFIG_CGROUP_CPUACCT=y
+CONFIG_CGROUP_DEVICE=y
+CONFIG_CGROUP_FREEZER=y
+CONFIG_CGROUP_SCHED=y
+CONFIG_CPUSETS=y
+CONFIG_MEMCG=y
+CONFIG_BLK_CGROUP=y
+CONFIG_CGROUP_PIDS=y
+CONFIG_CGROUP_BPF=y
+CONFIG_CGROUP_RDMA=y
+
+# 网络与文件系统支持
+CONFIG_VETH=y
+CONFIG_MACVLAN=y
+CONFIG_NETFILTER=y
+CONFIG_NETFILTER_ADVANCED=y
+CONFIG_NF_CONNTRACK=y
+CONFIG_NF_NAT=y
+CONFIG_BRIDGE=y
+CONFIG_OVERLAY_FS=y
+CONFIG_SQUASHFS=y
+CONFIG_SQUASHFS_XZ=y
+CONFIG_FUSE_FS=y
+
+# 其他常用支持
+CONFIG_SECURITY=y
+CONFIG_SECURITYFS=y
+CONFIG_SECURITY_SELINUX=y
+CONFIG_DEVMEM=y
+CONFIG_DEVKMEM=y
+CONFIG_PROC_FS=y
+CONFIG_SYSFS=y
+CONFIG_POSIX_MQUEUE=y
+
+# Android 兼容
+CONFIG_ANDROID=y
+CONFIG_ANDROID_BINDER_IPC=y
+CONFIG_ANDROID_BINDERFS=y
+EOF
+          echo "LXC config 已成功追加到 sun_defconfig"
+
+      - name: 编译内核（OnePlus 官方脚本）
         run: |
           cd workspace/kernel_workspace/kernel_platform
+          
           echo "开始编译 OnePlus 13 (sun) 内核，LTO=thin + REPACK_IMG"
-          LTO=thin REPACK_IMG=true ./build/kernel/build.sh -c sun
+          LTO=thin REPACK_IMG=true ./oplus/build/oplus_build_kernel.sh sun
 
       - name: 克隆 AnyKernel3 并复制内核文件
         run: |
@@ -81,31 +139,33 @@ jobs:
           
           echo "正在复制内核输出文件..."
           cd workspace/kernel_workspace/kernel_platform
-          find out -type f \( -name "Image*" -o -name "*.dtb*" -o -name "dtbo.img" -o -name "boot.img" \) -exec cp {} ${{ github.workspace }}/AnyKernel3/ \; 2>/dev/null || true
+          
+          find out -type f \( -name "Image*" -o -name "*.dtb*" -o -name "dtbo.img" -o -name "boot.img" \) -exec cp -v {} ${{ github.workspace }}/AnyKernel3/ \; 2>/dev/null || true
+          find . -path "*/dist/*" -type f \( -name "Image*" -o -name "boot.img" \) -exec cp -v {} ${{ github.workspace }}/AnyKernel3/ \; 2>/dev/null || true
           
           echo "复制完成的文件列表："
           ls -lh ${{ github.workspace }}/AnyKernel3/
 
-      - name: 配置 AnyKernel3（设备名、内核名称）
+      - name: 配置 AnyKernel3
         run: |
           cd AnyKernel3
           sed -i 's/device.name1=.*/device.name1=sun/' anykernel.sh
           sed -i 's/device.name2=.*/device.name2=OnePlus13/' anykernel.sh
-          sed -i 's/kernel.string=.*/kernel.string=OPlus LXC Kernel (ret9rn)/' anykernel.sh
-          echo "anykernel.sh 配置完成："
+          sed -i 's/kernel.string=.*/kernel.string=OPlus LXC Kernel by ret9rn/' anykernel.sh
+          echo "anykernel.sh 配置预览："
           grep -E 'device.name|kernel.string' anykernel.sh
 
       - name: 打包 AnyKernel3 ZIP
         run: |
           cd AnyKernel3
-          zip -r9 ${{ github.workspace }}/OPlus_LXC_Kernel-AnyKernel3.zip * -x .git* README.md
-          echo "打包完成："
+          zip -r9 ${{ github.workspace }}/OPlus_LXC_Kernel-OnePlus13-AnyKernel3.zip * -x .git* README.md *.md
+          echo "ZIP 打包完成："
           ls -lh ${{ github.workspace }}/*.zip
 
-      - name: 上传 AnyKernel3 ZIP（推荐刷 recovery）
+      - name: 上传 AnyKernel3 ZIP
         uses: actions/upload-artifact@v4
         with:
           name: OPlus-LXC-Kernel-OnePlus13-AnyKernel3
-          path: OPlus_LXC_Kernel-AnyKernel3.zip
+          path: OPlus_LXC_Kernel-OnePlus13-AnyKernel3.zip
           if-no-files-found: warn
           retention-days: 30
